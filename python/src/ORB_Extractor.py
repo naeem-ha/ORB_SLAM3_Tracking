@@ -1,13 +1,14 @@
 import cv2
 import numpy as np
-from math import atan2, cos, sin, sqrt, pi, ceil
+from math import sqrt, ceil, floor
+from typing import List, Tuple, Optional
+
 
 class ORBExtractor:
     PATCH_SIZE = 31
     HALF_PATCH_SIZE = 15
     EDGE_THRESHOLD = 19
-    
-    # ORB pattern from C implementation (256 pairs, each with x1,y1,x2,y2)
+
     BIT_PATTERN_31_ = [
         8,-3, 9,5, 4,2, 7,-12, -11,9, -8,2, 7,-12, 12,-13, 2,-13, 2,12,
         1,-7, 1,6, -2,-10, -2,-4, -13,-13, -11,-8, -13,-3, -12,-9, 10,4, 11,9,
@@ -62,168 +63,437 @@ class ORBExtractor:
         7,-4, 8,-12, -10,4, -10,9, 7,3, 12,4, 9,-7, 10,-2, 7,0, 12,-2,
         -1,-6, 0,-11
     ]
-    
-    # Convert to 512 (x, y) pairs for Python implementation
-    ORB_PATTERN = np.array(BIT_PATTERN_31_, dtype=np.float32).reshape(256, 4)
-    ORB_PATTERN = np.vstack([ORB_PATTERN[:, :2], ORB_PATTERN[:, 2:]])  # Shape: (512, 2)
 
-    def __init__(self, nfeatures=1000, scale_factor=1.2, nlevels=8, ini_th_FAST=20, min_th_FAST=7):
+    PATTERN = np.array(BIT_PATTERN_31_, dtype=np.float32).reshape(-1, 4)
+
+    def __init__(self, nfeatures: int = 1000, scale_factor: float = 1.2, nlevels: int = 8,
+                 ini_th_fast: int = 20, min_th_fast: int = 7):
         self.nfeatures = nfeatures
         self.scale_factor = scale_factor
         self.nlevels = nlevels
-        self.ini_th_FAST = ini_th_FAST
-        self.min_th_FAST = min_th_FAST
+        self.ini_th_fast = ini_th_fast
+        self.min_th_fast = min_th_fast
 
-        # Precompute scale factors and sigma
-        self.mvScaleFactor = np.array([scale_factor**i for i in range(nlevels)], dtype=np.float32)
-        self.mvLevelSigma2 = self.mvScaleFactor**2
-        self.mvInvScaleFactor = 1.0 / self.mvScaleFactor
-        self.mvInvLevelSigma2 = 1.0 / self.mvLevelSigma2
-        self.mvImagePyramid = [None] * nlevels
+        self.mv_scale_factor = np.ones(nlevels, dtype=np.float32)
+        self.mv_level_sigma2 = np.ones(nlevels, dtype=np.float32)
+        self.mv_scale_factor[0] = 1.0
+        self.mv_level_sigma2[0] = 1.0
+        for i in range(1, nlevels):
+            self.mv_scale_factor[i] = self.mv_scale_factor[i-1] * scale_factor
+            self.mv_level_sigma2[i] = self.mv_scale_factor[i] ** 2
 
-        # Distribute features across levels
+        self.mv_inv_scale_factor = 1.0 / self.mv_scale_factor
+        self.mv_inv_level_sigma2 = 1.0 / self.mv_level_sigma2
+        self.mv_image_pyramid = [None] * nlevels
+
         factor = 1.0 / scale_factor
-        nDesiredFeaturesPerScale = nfeatures * (1 - factor) / (1 - factor**nlevels)
-        self.mnFeaturesPerLevel = np.round(nDesiredFeaturesPerScale * factor**np.arange(nlevels)).astype(int)
-        self.mnFeaturesPerLevel[-1] = max(nfeatures - np.sum(self.mnFeaturesPerLevel[:-1]), 0)
+        n_desired_features_per_scale = nfeatures * (1 - factor) / (1 - (factor ** nlevels))
+        self.mn_features_per_level = np.zeros(nlevels, dtype=int)
+        sum_features = 0
+        for level in range(nlevels-1):
+            self.mn_features_per_level[level] = round(n_desired_features_per_scale)
+            sum_features += self.mn_features_per_level[level]
+            n_desired_features_per_scale *= factor
+        self.mn_features_per_level[nlevels-1] = max(nfeatures - sum_features, 0)
 
-        self.umax = self._initialize_umax()
+        self.umax = np.zeros(self.HALF_PATCH_SIZE + 1, dtype=np.int32)
+        vmax = floor(self.HALF_PATCH_SIZE * sqrt(2.0) / 2 + 1)
+        vmin = ceil(self.HALF_PATCH_SIZE * sqrt(2.0) / 2)
+        hp2 = self.HALF_PATCH_SIZE ** 2
+        for v in range(vmax + 1):
+            self.umax[v] = round(sqrt(hp2 - v * v))
+        v0 = 0
+        for v in range(self.HALF_PATCH_SIZE, vmin-1, -1):
+            while self.umax[v0] == self.umax[v0 + 1]:
+                v0 += 1
+            self.umax[v] = v0
+            v0 += 1
 
-    def _initialize_umax(self):
-        # Precompute circle boundary for orientation
-        umax = np.zeros(self.HALF_PATCH_SIZE + 1, dtype=np.int32)
-        vmax = ceil(self.HALF_PATCH_SIZE * sqrt(2) / 2)
-        hp2 = self.HALF_PATCH_SIZE**2
-        v_range = np.arange(vmax + 1)
-        umax[:vmax + 1] = np.round(np.sqrt(hp2 - v_range**2)).astype(int)
-        # Mirror values for v > vmax
-        for v in range(vmax, self.HALF_PATCH_SIZE + 1):
-            umax[v] = umax[self.HALF_PATCH_SIZE - v]
-        return umax
-
-    def compute_pyramid(self, image):
-        assert image.ndim == 2, "Image must be grayscale"
+    def compute_pyramid(self, image: np.ndarray):
+        """Compute the image pyramid with border padding."""
+        assert image.ndim == 2 and image.dtype == np.uint8, "Image must be grayscale uint8"
         h, w = image.shape
-        self.mvImagePyramid[0] = image
-
-        for level in range(1, self.nlevels):
-            scale = self.mvInvScaleFactor[level]
-            sz = (int(round(w * scale)), int(round(h * scale)))
-            # Resize directly to target size, avoiding temporary buffer
-            self.mvImagePyramid[level] = cv2.resize(
-                image, sz, interpolation=cv2.INTER_LINEAR
-            )
-
-    def IC_Angle(self, image, pt):
-        x, y = int(pt[0]), int(pt[1])
-        hps = self.HALF_PATCH_SIZE
-        patch = image[y - hps:y + hps + 1, x - hps:x + hps + 1]
-        if patch.shape != (self.PATCH_SIZE, self.PATCH_SIZE):
-            return 0.0
-
-        m_01, m_10 = 0.0, 0.0
-        center = hps
-
-        # Compute moments using vectorized operations
-        for v in range(1, hps + 1):
-            d = self.umax[v]
-            u_range = np.arange(-d, d + 1)
-            val_plus = patch[center + v, center + u_range].astype(np.float32)
-            val_minus = patch[center - v, center + u_range].astype(np.float32)
-            m_01 += v * np.sum(val_plus - val_minus)
-            m_10 += np.sum(u_range * (val_plus + val_minus))
-
-        return atan2(m_01, m_10) * 180.0 / pi
-
-    def compute_orientation(self, image, keypoints):
-        angles = np.array([self.IC_Angle(image, kp.pt) for kp in keypoints], dtype=np.float32)
-        for kp, angle in zip(keypoints, angles):
-            kp.angle = angle
-
-    def compute_orb_descriptor(self, keypoints, img):
-        if not keypoints:
-            return [], np.zeros((0, 32), dtype=np.uint8)
-
-        h, w = img.shape
-        descriptors = np.zeros((len(keypoints), 32), dtype=np.uint8)
-        valid_kps = []
-        valid_idx = []
-
-        # Filter valid keypoints
-        for idx, kp in enumerate(keypoints):
-            x, y = int(kp.pt[0]), int(kp.pt[1])
-            if (self.HALF_PATCH_SIZE <= x < w - self.HALF_PATCH_SIZE and
-                self.HALF_PATCH_SIZE <= y < h - self.HALF_PATCH_SIZE):
-                valid_kps.append(kp)
-                valid_idx.append(idx)
-
-        if not valid_kps:
-            return [], descriptors
-
-        # Precompute rotations
-        angles = np.radians([kp.angle for kp in valid_kps])
-        cos_a = np.cos(angles)
-        sin_a = np.sin(angles)
-        cx = np.array([kp.pt[0] for kp in valid_kps])
-        cy = np.array([kp.pt[1] for kp in valid_kps])
-
-        for i in range(32):
-            for j in range(8):
-                idx = i * 16 + 2 * j
-                p1, p2 = self.ORB_PATTERN[idx], self.ORB_PATTERN[idx + 1]
-
-                # Rotate points for all keypoints
-                x1 = p1[0] * cos_a - p1[1] * sin_a + cx
-                y1 = p1[0] * sin_a + p1[1] * cos_a + cy
-                x2 = p2[0] * cos_a - p2[1] * sin_a + cx
-                y2 = p2[0] * sin_a + p2[1] * cos_a + cy
-
-                # Round to integers
-                x1, y1 = np.round(x1).astype(int), np.round(y1).astype(int)
-                x2, y2 = np.round(x2).astype(int), np.round(y2).astype(int)
-
-                # Check bounds and compare intensities
-                valid = (x1 >= 0) & (x1 < w) & (y1 >= 0) & (y1 < h) & \
-                        (x2 >= 0) & (x2 < w) & (y2 >= 0) & (y2 < h)
-                intensities1 = np.zeros_like(x1)
-                intensities2 = np.zeros_like(x2)
-                intensities1[valid] = img[y1[valid], x1[valid]]
-                intensities2[valid] = img[y2[valid], x2[valid]]
-                bits = (intensities1 < intensities2).astype(np.uint8) << j
-                descriptors[valid_idx, i] |= bits
-
-        return valid_kps, descriptors[np.array(valid_idx)]
-
-    def __call__(self, image):
-        self.compute_pyramid(image)
-        keypoints_all = []
-        descriptors_all = []
-
-        # Initialize FAST detectors
-        fast = cv2.FastFeatureDetector_create(threshold=self.ini_th_FAST, nonmaxSuppression=True)
-        fast_low = cv2.FastFeatureDetector_create(threshold=self.min_th_FAST, nonmaxSuppression=True)
 
         for level in range(self.nlevels):
-            img = self.mvImagePyramid[level]
-            kps = fast.detect(img, None)
-            
-            # Fallback to lower threshold if needed
-            if len(kps) < self.mnFeaturesPerLevel[level]:
-                kps = fast_low.detect(img, None)
-                kps = kps[:self.mnFeaturesPerLevel[level]]  # Limit keypoints
+            scale = self.mv_inv_scale_factor[level]
+            sz = (max(1, round(w * scale)), max(1, round(h * scale)))
+            temp = np.zeros((sz[1] + 2 * self.EDGE_THRESHOLD, sz[0] + 2 * self.EDGE_THRESHOLD), dtype=np.uint8)
 
-            # Adjust keypoint coordinates
-            for kp in kps:
+            if level == 0:
+                temp[self.EDGE_THRESHOLD:self.EDGE_THRESHOLD+h,
+                     self.EDGE_THRESHOLD:self.EDGE_THRESHOLD+w] = image
+            else:
+                prev_img = self.mv_image_pyramid[level-1][
+                    self.EDGE_THRESHOLD:-self.EDGE_THRESHOLD,
+                    self.EDGE_THRESHOLD:-self.EDGE_THRESHOLD]
+                resized = cv2.resize(prev_img, (sz[0], sz[1]), interpolation=cv2.INTER_LINEAR)
+                temp[self.EDGE_THRESHOLD:self.EDGE_THRESHOLD+sz[1],
+                     self.EDGE_THRESHOLD:self.EDGE_THRESHOLD+sz[0]] = resized
+
+            self.mv_image_pyramid[level] = cv2.copyMakeBorder(
+                temp, self.EDGE_THRESHOLD, self.EDGE_THRESHOLD,
+                self.EDGE_THRESHOLD, self.EDGE_THRESHOLD,
+                cv2.BORDER_REFLECT_101
+            )
+
+    def ic_angle(self, image: np.ndarray, pt_x: float, pt_y: float, umax: np.ndarray, half_patch_size: int) -> float:
+        """Compute the orientation of a keypoint."""
+        m_01, m_10 = 0.0, 0.0
+        y, x = int(round(pt_y)), int(round(pt_x))
+        h, w = image.shape
+
+        if not (half_patch_size <= x < w - half_patch_size and
+                half_patch_size <= y < h - half_patch_size):
+            return 0.0
+
+        for u in range(-half_patch_size, half_patch_size + 1):
+            m_10 += u * image[y, x + u]
+
+        for v in range(1, half_patch_size + 1):
+            v_sum = 0
+            d = umax[v]
+            for u in range(-int(d), int(d) + 1):
+                val_plus = image[y + v, x + u]
+                val_minus = image[y - v, x + u]
+                v_sum += (val_plus - val_minus)
+                m_10 += u * (val_plus + val_minus)
+            m_01 += v * v_sum
+
+        return np.arctan2(m_01, m_10) * 180.0 / np.pi
+
+    def compute_orb_descriptors_batch(self, img: np.ndarray, kpts_x: np.ndarray, kpts_y: np.ndarray,
+                                     angles: np.ndarray, pattern: np.ndarray, half_patch_size: int) -> np.ndarray:
+        """Compute ORB descriptors for multiple keypoints."""
+        n_kpts = len(kpts_x)
+        desc = np.zeros((n_kpts, 32), dtype=np.uint8)
+        h, w = img.shape
+
+        for k in range(n_kpts):
+            angle = angles[k]
+            x = kpts_x[k]
+            y = kpts_y[k]
+            cos_a = np.cos(angle * np.pi / 180.0)
+            sin_a = np.sin(angle * np.pi / 180.0)
+            x_int = int(round(x))
+            y_int = int(round(y))
+
+            if not (x_int - half_patch_size >= 0 and
+                    x_int + half_patch_size < w and
+                    y_int - half_patch_size >= 0 and
+                    y_int + half_patch_size < h):
+                continue
+
+            for i in range(32):
+                val = 0
+                pattern_offset = i * 8
+                for j in range(8):
+                    idx = pattern_offset + j
+                    x1, y1, x2, y2 = pattern[idx]
+
+                    u1 = int(round(x1 * cos_a - y1 * sin_a))
+                    v1 = int(round(x1 * sin_a + y1 * cos_a))
+                    u2 = int(round(x2 * cos_a - y2 * sin_a))
+                    v2 = int(round(x2 * sin_a + y2 * cos_a))
+
+                    px1 = x_int + u1
+                    py1 = y_int + v1
+                    px2 = x_int + u2
+                    py2 = y_int + v2
+
+                    if (0 <= px1 < w and 0 <= py1 < h and
+                        0 <= px2 < w and 0 <= py2 < h):
+                        t0 = img[py1, px1]
+                        t1 = img[py2, px2]
+                        val |= (t0 < t1) << j
+                desc[k, i] = val
+
+        return desc
+
+    class ExtractorNode:
+        def __init__(self):
+            self.ul = (0, 0)
+            self.ur = (0, 0)
+            self.bl = (0, 0)
+            self.br = (0, 0)
+            self.v_keys = []
+            self.b_no_more = False
+
+        def divide_node(self, n1: 'ORBExtractor.ExtractorNode', n2: 'ORBExtractor.ExtractorNode',
+                       n3: 'ORBExtractor.ExtractorNode', n4: 'ORBExtractor.ExtractorNode'):
+            half_x = ceil((self.ur[0] - self.ul[0]) / 2)
+            half_y = ceil((self.br[1] - self.ul[1]) / 2)
+
+            n1.ul = self.ul
+            n1.ur = (self.ul[0] + half_x, self.ul[1])
+            n1.bl = (self.ul[0], self.ul[1] + half_y)
+            n1.br = (self.ul[0] + half_x, self.ul[1] + half_y)
+
+            n2.ul = n1.ur
+            n2.ur = self.ur
+            n2.bl = n1.br
+            n2.br = (self.ur[0], self.ul[1] + half_y)
+
+            n3.ul = n1.bl
+            n3.ur = n1.br
+            n3.bl = self.bl
+            n3.br = (n1.br[0], self.bl[1])
+
+            n4.ul = n3.ur
+            n4.ur = n2.br
+            n4.bl = n3.br
+            n4.br = self.br
+
+            for kp in self.v_keys:
+                if kp.pt[0] < n1.ur[0]:
+                    if kp.pt[1] < n1.br[1]:
+                        n1.v_keys.append(kp)
+                    else:
+                        n3.v_keys.append(kp)
+                elif kp.pt[1] < n1.br[1]:
+                    n2.v_keys.append(kp)
+                else:
+                    n4.v_keys.append(kp)
+
+            if len(n1.v_keys) == 1:
+                n1.b_no_more = True
+            if len(n2.v_keys) == 1:
+                n2.b_no_more = True
+            if len(n3.v_keys) == 1:
+                n3.b_no_more = True
+            if len(n4.v_keys) == 1:
+                n4.b_no_more = True
+
+    def distribute_oct_tree(self, v_to_distribute_keys: List[cv2.KeyPoint], min_x: int, max_x: int,
+                           min_y: int, max_y: int, n: int, level: int) -> List[cv2.KeyPoint]:
+        n_ini = max(1, round((max_x - min_x) / (max_y - min_y)))
+        h_x = (max_x - min_x) / n_ini
+
+        nodes = []
+        for i in range(n_ini):
+            node = self.ExtractorNode()
+            node.ul = (round(h_x * i), 0)
+            node.ur = (round(h_x * (i + 1)), 0)
+            node.bl = (node.ul[0], max_y - min_y)
+            node.br = (node.ur[0], max_y - min_y)
+            nodes.append(node)
+
+        for kp in v_to_distribute_keys:
+            idx = int(kp.pt[0] / h_x)
+            if 0 <= idx < n_ini:
+                nodes[idx].v_keys.append(kp)
+
+        nodes = [node for node in nodes if node.v_keys]
+        for node in nodes:
+            if len(node.v_keys) == 1:
+                node.b_no_more = True
+
+        b_finish = False
+        size_and_nodes = []
+
+        while not b_finish:
+            prev_size = len(nodes)
+            size_and_nodes.clear()
+            n_to_expand = 0
+
+            new_nodes = []
+            for node in nodes:
+                if node.b_no_more:
+                    new_nodes.append(node)
+                    continue
+
+                n1, n2, n3, n4 = self.ExtractorNode(), self.ExtractorNode(), self.ExtractorNode(), self.ExtractorNode()
+                node.divide_node(n1, n2, n3, n4)
+
+                if n1.v_keys:
+                    new_nodes.append(n1)
+                    if len(n1.v_keys) > 1:
+                        n_to_expand += 1
+                        size_and_nodes.append((len(n1.v_keys), n1))
+                if n2.v_keys:
+                    new_nodes.append(n2)
+                    if len(n2.v_keys) > 1:
+                        n_to_expand += 1
+                        size_and_nodes.append((len(n2.v_keys), n2))
+                if n3.v_keys:
+                    new_nodes.append(n3)
+                    if len(n3.v_keys) > 1:
+                        n_to_expand += 1
+                        size_and_nodes.append((len(n3.v_keys), n3))
+                if n4.v_keys:
+                    new_nodes.append(n4)
+                    if len(n4.v_keys) > 1:
+                        n_to_expand += 1
+                        size_and_nodes.append((len(n4.v_keys), n4))
+
+            nodes = new_nodes
+
+            if len(nodes) >= n or len(nodes) == prev_size:
+                b_finish = True
+            elif len(nodes) + n_to_expand * 3 > n:
+                while not b_finish:
+                    prev_size = len(nodes)
+                    prev_size_and_nodes = size_and_nodes.copy()
+                    size_and_nodes.clear()
+
+                    prev_size_and_nodes.sort(key=lambda x: (x[0], x[1].ul[0]), reverse=True)
+
+                    new_nodes = [node for node in nodes]
+                    for size, node in prev_size_and_nodes:
+                        n1, n2, n3, n4 = self.ExtractorNode(), self.ExtractorNode(), self.ExtractorNode(), self.ExtractorNode()
+                        node.divide_node(n1, n2, n3, n4)
+
+                        new_nodes = [n for n in new_nodes if n is not node]
+                        if n1.v_keys:
+                            new_nodes.append(n1)
+                            if len(n1.v_keys) > 1:
+                                size_and_nodes.append((len(n1.v_keys), n1))
+                        if n2.v_keys:
+                            new_nodes.append(n2)
+                            if len(n2.v_keys) > 1:
+                                size_and_nodes.append((len(n2.v_keys), n2))
+                        if n3.v_keys:
+                            new_nodes.append(n3)
+                            if len(n3.v_keys) > 1:
+                                size_and_nodes.append((len(n3.v_keys), n3))
+                        if n4.v_keys:
+                            new_nodes.append(n4)
+                            if len(n4.v_keys) > 1:
+                                size_and_nodes.append((len(n4.v_keys), n4))
+
+                        nodes = new_nodes
+                        if len(nodes) >= n:
+                            break
+
+                    if len(nodes) >= n or len(nodes) == prev_size:
+                        b_finish = True
+
+        result_keys = []
+        for node in nodes:
+            if not node.v_keys:
+                continue
+            best_kp = max(node.v_keys, key=lambda kp: kp.response, default=node.v_keys[0])
+            result_keys.append(best_kp)
+
+        return result_keys
+
+    def compute_keypoints_oct_tree(self) -> List[List[cv2.KeyPoint]]:
+        all_keypoints = [[] for _ in range(self.nlevels)]
+        W = 35.0
+
+        for level in range(self.nlevels):
+            min_border_x = self.EDGE_THRESHOLD - 3
+            min_border_y = min_border_x
+            max_border_x = self.mv_image_pyramid[level].shape[1] - self.EDGE_THRESHOLD + 3
+            max_border_y = self.mv_image_pyramid[level].shape[0] - self.EDGE_THRESHOLD + 3
+
+            v_to_distribute_keys = []
+            width = max_border_x - min_border_x
+            height = max_border_y - min_border_y
+            n_cols = max(1, width / W)
+            n_rows = max(1, height / W)
+            w_cell = ceil(width / n_cols)
+            h_cell = ceil(height / n_rows)
+
+            fast = cv2.FastFeatureDetector_create(threshold=self.ini_th_fast, nonmaxSuppression=True)
+            fast_low = cv2.FastFeatureDetector_create(threshold=self.min_th_fast, nonmaxSuppression=True)
+
+            for i in range(int(n_rows)):
+                ini_y = min_border_y + i * h_cell
+                max_y = min(ini_y + h_cell + 6, max_border_y)
+                if ini_y >= max_border_y - 3:
+                    continue
+
+                for j in range(int(n_cols)):
+                    ini_x = min_border_x + j * w_cell
+                    max_x = min(ini_x + w_cell + 6, max_border_x)
+                    if ini_x >= max_border_x - 6:
+                        continue
+
+                    cell_img = self.mv_image_pyramid[level][int(ini_y):int(max_y), int(ini_x):int(max_x)]
+                    kps = fast.detect(cell_img, None)
+
+                    if not kps:
+                        kps = fast_low.detect(cell_img, None)
+
+                    if kps:
+                        for kp in kps:
+                            kp.pt = (kp.pt[0] + ini_x, kp.pt[1] + ini_y)
+                            v_to_distribute_keys.append(kp)
+
+            keypoints = self.distribute_oct_tree(
+                v_to_distribute_keys, min_border_x, max_border_x,
+                min_border_y, max_border_y, self.mn_features_per_level[level], level
+            )
+
+            scaled_patch_size = self.PATCH_SIZE * self.mv_scale_factor[level]
+            for kp in keypoints:
+                kp.pt = (kp.pt[0] + min_border_x, kp.pt[1] + min_border_y)
                 kp.octave = level
-                kp.pt = (kp.pt[0] * self.mvScaleFactor[level], 
-                        kp.pt[1] * self.mvScaleFactor[level])
+                kp.size = scaled_patch_size
 
-            self.compute_orientation(img, kps)
-            kps, desc = self.compute_orb_descriptor(kps, img)
-            
-            keypoints_all.extend(kps)
-            if desc.size > 0:
-                descriptors_all.append(desc)
+            all_keypoints[level] = keypoints
 
-        descriptors_all = np.vstack(descriptors_all) if descriptors_all else np.zeros((0, 32), dtype=np.uint8)
-        return keypoints_all, descriptors_all
+        for level in range(self.nlevels):
+            for kp in all_keypoints[level]:
+                kp.angle = self.ic_angle(
+                    self.mv_image_pyramid[level], kp.pt[0], kp.pt[1], self.umax, self.HALF_PATCH_SIZE
+                )
+
+        return all_keypoints
+
+    def __call__(self, image: np.ndarray, mask: Optional[np.ndarray] = None,
+                 v_lapping_area: Optional[List[int]] = None) -> Tuple[List[cv2.KeyPoint], np.ndarray, int]:
+        if image.size == 0:
+            return [], np.zeros((0, 32), dtype=np.uint8), -1
+
+        assert image.ndim == 2 and image.dtype == np.uint8, "Image must be grayscale uint8"
+        if mask is not None:
+            assert mask.shape == image.shape and mask.dtype == np.uint8, "Invalid mask"
+
+        self.compute_pyramid(image)
+        all_keypoints = self.compute_keypoints_oct_tree()
+
+        n_keypoints = sum(len(kps) for kps in all_keypoints)
+        if n_keypoints == 0:
+            return [], np.zeros((0, 32), dtype=np.uint8), 0
+
+        keypoints = []
+        descriptors = np.zeros((n_keypoints, 32), dtype=np.uint8)
+        offset = 0
+        mono_index = 0
+        stereo_index = n_keypoints - 1
+
+        for level in range(self.nlevels):
+            kps = all_keypoints[level]
+            if not kps:
+                continue
+
+            working_mat = self.mv_image_pyramid[level].copy()
+            cv2.GaussianBlur(working_mat, (7, 7), 2, dst=working_mat, borderType=cv2.BORDER_REFLECT_101)
+
+            kpts_x = np.array([kp.pt[0] for kp in kps], dtype=np.float32)
+            kpts_y = np.array([kp.pt[1] for kp in kps], dtype=np.float32)
+            angles = np.array([kp.angle for kp in kps], dtype=np.float32)
+            desc = self.compute_orb_descriptors_batch(
+                working_mat, kpts_x, kpts_y, angles, self.PATTERN, self.HALF_PATCH_SIZE
+            )
+
+            n_kps_level = len(kps)
+            offset += n_kps_level
+
+            if level != 0:
+                scale = self.mv_scale_factor[level]
+                for kp in kps:
+                    kp.pt = (kp.pt[0] * scale, kp.pt[1] * scale)
+
+            for i, kp in enumerate(kps):
+                if v_lapping_area and v_lapping_area[0] <= kp.pt[0] <= v_lapping_area[1]:
+                    keypoints.insert(stereo_index, kp)
+                    descriptors[stereo_index] = desc[i]
+                    stereo_index -= 1
+                else:
+                    keypoints.insert(mono_index, kp)
+                    descriptors[mono_index] = desc[i]
+                    mono_index += 1
+
+        return keypoints, descriptors, mono_index

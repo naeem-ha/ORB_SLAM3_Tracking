@@ -1,17 +1,73 @@
-# import cv2
-# import numpy as np
+import cv2
+import numpy as np
 # import matplotlib.pyplot as plt
-# from src.ORBMatcher3D import ORBMatcher3D
+from src.ORBMatcher3D import ORBMatcher3D
 # from src.ORB_Extractor import ORBExtractor
 # # Load the images
-# source = cv2.imread("/home/hamza-naeem/Documents/ORB_SLAM3_Tracking/1403636579763555584.png", cv2.IMREAD_GRAYSCALE)
-# target = cv2.imread("/home/hamza-naeem/Documents/ORB_SLAM3_Tracking/1403636579813555456.png", cv2.IMREAD_GRAYSCALE)
+from python_orb_slam3 import ORBExtractor as OGORBExtractor
+
+source = cv2.imread("/home/hamza-naeem/Documents/ORB_SLAM3_Tracking/1403636579763555584.png", cv2.IMREAD_GRAYSCALE)
+target = cv2.imread("/home/hamza-naeem/Documents/ORB_SLAM3_Tracking/1403636579813555456.png", cv2.IMREAD_GRAYSCALE)
 import time
 
-# orb_slam3 = ORBExtractor(nfeatures=1000, scale_factor=1.2, nlevels=8, ini_th_FAST=20, min_th_FAST=7)
+K = np.array([
+    [458.654, 0, 367.215],
+    [0, 457.296, 248.375],
+    [0, 0, 1]
+])
+FAKE_DEPTH = 1.0
 
-# kp1_s3, des1_s3 = orb_slam3(source)
-# kp2_s3, des2_s3 = orb_slam3(target)
+orb_slam3 = OGORBExtractor()
+
+start = time.time()
+kp1_s3, des1_s3 = orb_slam3.detectAndCompute(source)
+kp2_s3, des2_s3 = orb_slam3.detectAndCompute(target)
+
+print("Time for 2 extractions" + str (time.time() - start))
+# --- Backproject keypoints from image 1 into 3D space (fake Z=1) ---
+map_points = []
+K_inv = np.linalg.inv(K)
+for i, kp in enumerate(kp1_s3):
+    if des1_s3 is None or i >= len(des1_s3):
+        continue
+    x, y = kp.pt
+    p_img = np.array([x * FAKE_DEPTH, y * FAKE_DEPTH, FAKE_DEPTH])
+    X = K_inv @ p_img
+    mp = {
+        'pos': X,
+        'desc': des1_s3[i],
+        'normal': np.array([0, 0, 1]),  # assume frontal normals
+        'angle': kp.angle
+    }
+    map_points.append(mp)
+
+# --- Camera pose: identity (matching between close images) ---
+Rcw = np.eye(3)
+tcw = np.zeros((3, 1))
+
+# --- Initialize matcher ---
+matcher = ORBMatcher3D(
+    camera_matrix=K,
+    scale_factors=[1.2 ** i for i in range(8)],
+    check_orientation=True
+)
+
+# --- Perform matching ---
+matches = matcher.match(
+    map_points=map_points,
+    keypoints=kp2_s3,
+    descriptors=des2_s3,
+    Rcw=Rcw,
+    tcw=tcw
+)
+
+# --- Draw matches ---
+matches = sorted(matches, key=lambda m: m.distance)
+matched_img = cv2.drawMatches(source, kp1_s3, target, kp2_s3, matches[:50], None, flags=2)
+
+# --- Save & Show ---
+cv2.imwrite("OG_ORB-SLAM3_Feature_Matches.jpg", matched_img)
+
 
 
 
@@ -152,12 +208,12 @@ img1 = cv2.imread("/home/hamza-naeem/Documents/ORB_SLAM3_Tracking/14036365797635
 img2 = cv2.imread("/home/hamza-naeem/Documents/ORB_SLAM3_Tracking/1403636579813555456.png", cv2.IMREAD_GRAYSCALE)
 
 # --- Initialize extractor ---
-orb = ORBExtractor(nfeatures=1000, scale_factor=1.2, nlevels=8, ini_th_FAST=20, min_th_FAST=7)
+orb = ORBExtractor(nfeatures=1000, scale_factor=1.2, nlevels=8, ini_th_fast=20, min_th_fast=7)
 
 # --- Extract features ---
 start = time.time()
-kp1, desc1 = orb(img1)
-kp2, desc2 = orb(img2)
+kp1, desc1, _ = orb(img1)
+kp2, desc2, _ = orb(img2)
 print("Time for 2 extractions" + str (time.time() - start))
 # --- Backproject keypoints from image 1 into 3D space (fake Z=1) ---
 map_points = []
