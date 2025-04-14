@@ -3,7 +3,6 @@ import numpy as np
 from math import sqrt, ceil, floor
 from typing import List, Tuple, Optional
 
-
 class ORBExtractor:
     PATCH_SIZE = 31
     HALF_PATCH_SIZE = 15
@@ -66,8 +65,8 @@ class ORBExtractor:
 
     PATTERN = np.array(BIT_PATTERN_31_, dtype=np.float32).reshape(-1, 4)
 
-    def __init__(self, nfeatures: int = 1000, scale_factor: float = 1.2, nlevels: int = 8,
-                 ini_th_fast: int = 20, min_th_fast: int = 7):
+    def __init__(self, nfeatures: int = 1500, scale_factor: float = 1.2, nlevels: int = 8,
+                 ini_th_fast: int = 10, min_th_fast: int = 3):
         self.nfeatures = nfeatures
         self.scale_factor = scale_factor
         self.nlevels = nlevels
@@ -95,6 +94,7 @@ class ORBExtractor:
             sum_features += self.mn_features_per_level[level]
             n_desired_features_per_scale *= factor
         self.mn_features_per_level[nlevels-1] = max(nfeatures - sum_features, 0)
+        print(f"Features per level: {self.mn_features_per_level}")
 
         self.umax = np.zeros(self.HALF_PATCH_SIZE + 1, dtype=np.int32)
         vmax = floor(self.HALF_PATCH_SIZE * sqrt(2.0) / 2 + 1)
@@ -138,7 +138,7 @@ class ORBExtractor:
 
     def ic_angle(self, image: np.ndarray, pt_x: float, pt_y: float, umax: np.ndarray, half_patch_size: int) -> float:
         """Compute the orientation of a keypoint."""
-        m_01, m_10 = 0.0, 0.0
+        m_01, m_10 = np.int32(0), np.int32(0)
         y, x = int(round(pt_y)), int(round(pt_x))
         h, w = image.shape
 
@@ -147,65 +147,60 @@ class ORBExtractor:
             return 0.0
 
         for u in range(-half_patch_size, half_patch_size + 1):
-            m_10 += u * image[y, x + u]
+            m_10 += np.int32(u * image[y, x + u])
 
         for v in range(1, half_patch_size + 1):
-            v_sum = 0
+            v_sum = np.int32(0)
             d = umax[v]
             for u in range(-int(d), int(d) + 1):
                 val_plus = image[y + v, x + u]
                 val_minus = image[y - v, x + u]
-                v_sum += (val_plus - val_minus)
-                m_10 += u * (val_plus + val_minus)
-            m_01 += v * v_sum
+                v_sum += np.int32(val_plus - val_minus)
+                m_10 += np.int32(u * (val_plus + val_minus))
+            m_01 += np.int32(v * v_sum)
 
         return np.arctan2(m_01, m_10) * 180.0 / np.pi
 
     def compute_orb_descriptors_batch(self, img: np.ndarray, kpts_x: np.ndarray, kpts_y: np.ndarray,
                                      angles: np.ndarray, pattern: np.ndarray, half_patch_size: int) -> np.ndarray:
-        """Compute ORB descriptors for multiple keypoints."""
+        """Compute ORB descriptors for multiple keypoints using vectorization."""
         n_kpts = len(kpts_x)
         desc = np.zeros((n_kpts, 32), dtype=np.uint8)
         h, w = img.shape
 
-        for k in range(n_kpts):
-            angle = angles[k]
-            x = kpts_x[k]
-            y = kpts_y[k]
-            cos_a = np.cos(angle * np.pi / 180.0)
-            sin_a = np.sin(angle * np.pi / 180.0)
-            x_int = int(round(x))
-            y_int = int(round(y))
+        cos_a = np.cos(angles * np.pi / 180.0)
+        sin_a = np.sin(angles * np.pi / 180.0)
+        x_int = np.round(kpts_x).astype(np.int32)
+        y_int = np.round(kpts_y).astype(np.int32)
 
-            if not (x_int - half_patch_size >= 0 and
-                    x_int + half_patch_size < w and
-                    y_int - half_patch_size >= 0 and
-                    y_int + half_patch_size < h):
-                continue
+        valid = ((x_int - half_patch_size >= 0) & (x_int + half_patch_size < w) &
+                 (y_int - half_patch_size >= 0) & (y_int + half_patch_size < h))
 
-            for i in range(32):
-                val = 0
-                pattern_offset = i * 8
-                for j in range(8):
-                    idx = pattern_offset + j
-                    x1, y1, x2, y2 = pattern[idx]
+        for i in range(32):
+            pattern_offset = i * 8
+            for j in range(8):
+                idx = pattern_offset + j
+                x1, y1, x2, y2 = pattern[idx]
 
-                    u1 = int(round(x1 * cos_a - y1 * sin_a))
-                    v1 = int(round(x1 * sin_a + y1 * cos_a))
-                    u2 = int(round(x2 * cos_a - y2 * sin_a))
-                    v2 = int(round(x2 * sin_a + y2 * cos_a))
+                u1 = np.round(x1 * cos_a - y1 * sin_a).astype(np.int32)
+                v1 = np.round(x1 * sin_a + y1 * cos_a).astype(np.int32)
+                u2 = np.round(x2 * cos_a - y2 * sin_a).astype(np.int32)
+                v2 = np.round(x2 * sin_a + y2 * cos_a).astype(np.int32)
 
-                    px1 = x_int + u1
-                    py1 = y_int + v1
-                    px2 = x_int + u2
-                    py2 = y_int + v2
+                px1 = x_int + u1
+                py1 = y_int + v1
+                px2 = x_int + u2
+                py2 = y_int + v2
 
-                    if (0 <= px1 < w and 0 <= py1 < h and
-                        0 <= px2 < w and 0 <= py2 < h):
-                        t0 = img[py1, px1]
-                        t1 = img[py2, px2]
-                        val |= (t0 < t1) << j
-                desc[k, i] = val
+                mask = (valid & (px1 >= 0) & (px1 < w) & (py1 >= 0) & (py1 < h) &
+                        (px2 >= 0) & (px2 < w) & (py2 >= 0) & (py2 < h))
+
+                t0 = np.zeros(n_kpts, dtype=np.uint8)
+                t1 = np.zeros(n_kpts, dtype=np.uint8)
+                t0[mask] = img[py1[mask], px1[mask]]
+                t1[mask] = img[py2[mask], px2[mask]]
+                bit_value = ((t0 < t1) << j).astype(np.uint8)
+                desc[:, i] |= bit_value
 
         return desc
 
@@ -434,9 +429,11 @@ class ORBExtractor:
             all_keypoints[level] = keypoints
 
         for level in range(self.nlevels):
+            img = self.mv_image_pyramid[level]
+            img_blurred = cv2.GaussianBlur(img, (5, 5), 1.0)
             for kp in all_keypoints[level]:
                 kp.angle = self.ic_angle(
-                    self.mv_image_pyramid[level], kp.pt[0], kp.pt[1], self.umax, self.HALF_PATCH_SIZE
+                    img_blurred, kp.pt[0], kp.pt[1], self.umax, self.HALF_PATCH_SIZE
                 )
 
         return all_keypoints
