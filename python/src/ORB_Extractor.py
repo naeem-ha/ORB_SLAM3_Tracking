@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from math import sqrt, ceil, floor
 from typing import List, Tuple, Optional
+from numba import jit, prange
 
 class ORBExtractor:
     PATCH_SIZE = 31
@@ -136,10 +137,13 @@ class ORBExtractor:
                 cv2.BORDER_REFLECT_101
             )
 
-    def ic_angle(self, image: np.ndarray, pt_x: float, pt_y: float, umax: np.ndarray, half_patch_size: int) -> float:
-        """Compute the orientation of a keypoint."""
+    @staticmethod
+    @jit(nopython=True)
+    def ic_angle_numba(image: np.ndarray, pt_x: float, pt_y: float, umax: np.ndarray, half_patch_size: int) -> float:
+        """Compute the orientation of a keypoint using Numba."""
         m_01, m_10 = np.int32(0), np.int32(0)
-        y, x = int(round(pt_y)), int(round(pt_x))
+        y = int(round(pt_y))
+        x = int(round(pt_x))
         h, w = image.shape
 
         if not (half_patch_size <= x < w - half_patch_size and
@@ -151,58 +155,81 @@ class ORBExtractor:
 
         for v in range(1, half_patch_size + 1):
             v_sum = np.int32(0)
-            d = umax[v]
-            for u in range(-int(d), int(d) + 1):
-                val_plus = image[y + v, x + u]
-                val_minus = image[y - v, x + u]
-                v_sum += np.int32(val_plus - val_minus)
+            d = int(umax[v])
+            for u in range(-d, d + 1):
+                val_plus = np.int32(image[y + v, x + u])
+                val_minus = np.int32(image[y - v, x + u])
+                v_sum += val_plus - val_minus
                 m_10 += np.int32(u * (val_plus + val_minus))
             m_01 += np.int32(v * v_sum)
 
-        return np.arctan2(m_01, m_10) * 180.0 / np.pi
+        return np.arctan2(float(m_01), float(m_10)) * 180.0 / np.pi
 
-    def compute_orb_descriptors_batch(self, img: np.ndarray, kpts_x: np.ndarray, kpts_y: np.ndarray,
-                                     angles: np.ndarray, pattern: np.ndarray, half_patch_size: int) -> np.ndarray:
-        """Compute ORB descriptors for multiple keypoints using vectorization."""
+    def ic_angle(self, image: np.ndarray, pt_x: float, pt_y: float, umax: np.ndarray, half_patch_size: int) -> float:
+        """Wrapper for Numba-optimized ic_angle."""
+        return self.ic_angle_numba(image, pt_x, pt_y, umax, half_patch_size)
+
+    @staticmethod
+    @jit(nopython=True, parallel=True)
+    def compute_orb_descriptors_batch_numba(img: np.ndarray, kpts_x: np.ndarray, kpts_y: np.ndarray,
+                                            angles: np.ndarray, pattern: np.ndarray, half_patch_size: int) -> np.ndarray:
+        """Compute ORB descriptors for multiple keypoints using Numba with parallelization."""
         n_kpts = len(kpts_x)
         desc = np.zeros((n_kpts, 32), dtype=np.uint8)
         h, w = img.shape
 
+        # Precompute cos and sin for all angles
         cos_a = np.cos(angles * np.pi / 180.0)
         sin_a = np.sin(angles * np.pi / 180.0)
         x_int = np.round(kpts_x).astype(np.int32)
         y_int = np.round(kpts_y).astype(np.int32)
 
-        valid = ((x_int - half_patch_size >= 0) & (x_int + half_patch_size < w) &
-                 (y_int - half_patch_size >= 0) & (y_int + half_patch_size < h))
+        # Compute valid keypoints
+        valid = np.ones(n_kpts, dtype=np.bool_)
+        for k in range(n_kpts):
+            if not (x_int[k] - half_patch_size >= 0 and x_int[k] + half_patch_size < w and
+                    y_int[k] - half_patch_size >= 0 and y_int[k] + half_patch_size < h):
+                valid[k] = False
 
-        for i in range(32):
-            pattern_offset = i * 8
-            for j in range(8):
-                idx = pattern_offset + j
-                x1, y1, x2, y2 = pattern[idx]
+        # Parallel loop over keypoints
+        for k in prange(n_kpts):
+            if not valid[k]:
+                continue
 
-                u1 = np.round(x1 * cos_a - y1 * sin_a).astype(np.int32)
-                v1 = np.round(x1 * sin_a + y1 * cos_a).astype(np.int32)
-                u2 = np.round(x2 * cos_a - y2 * sin_a).astype(np.int32)
-                v2 = np.round(x2 * sin_a + y2 * cos_a).astype(np.int32)
+            cos_k = cos_a[k]
+            sin_k = sin_a[k]
+            x_k = x_int[k]
+            y_k = y_int[k]
 
-                px1 = x_int + u1
-                py1 = y_int + v1
-                px2 = x_int + u2
-                py2 = y_int + v2
+            for i in range(32):
+                pattern_offset = i * 8
+                for j in range(8):
+                    idx = pattern_offset + j
+                    x1, y1, x2, y2 = pattern[idx]
 
-                mask = (valid & (px1 >= 0) & (px1 < w) & (py1 >= 0) & (py1 < h) &
-                        (px2 >= 0) & (px2 < w) & (py2 >= 0) & (py2 < h))
+                    u1 = int(round(x1 * cos_k - y1 * sin_k))
+                    v1 = int(round(x1 * sin_k + y1 * cos_k))
+                    u2 = int(round(x2 * cos_k - y2 * sin_k))
+                    v2 = int(round(x2 * sin_k + y2 * cos_k))
 
-                t0 = np.zeros(n_kpts, dtype=np.uint8)
-                t1 = np.zeros(n_kpts, dtype=np.uint8)
-                t0[mask] = img[py1[mask], px1[mask]]
-                t1[mask] = img[py2[mask], px2[mask]]
-                bit_value = ((t0 < t1) << j).astype(np.uint8)
-                desc[:, i] |= bit_value
+                    px1 = x_k + u1
+                    py1 = y_k + v1
+                    px2 = x_k + u2
+                    py2 = y_k + v2
+
+                    if (px1 >= 0 and px1 < w and py1 >= 0 and py1 < h and
+                        px2 >= 0 and px2 < w and py2 >= 0 and py2 < h):
+                        t0 = img[py1, px1]
+                        t1 = img[py2, px2]
+                        bit_value = 1 if t0 < t1 else 0
+                        desc[k, i] |= (bit_value << j)
 
         return desc
+
+    def compute_orb_descriptors_batch(self, img: np.ndarray, kpts_x: np.ndarray, kpts_y: np.ndarray,
+                                     angles: np.ndarray, pattern: np.ndarray, half_patch_size: int) -> np.ndarray:
+        """Wrapper for Numba-optimized descriptor computation."""
+        return self.compute_orb_descriptors_batch_numba(img, kpts_x, kpts_y, angles, pattern, half_patch_size)
 
     class ExtractorNode:
         def __init__(self):
