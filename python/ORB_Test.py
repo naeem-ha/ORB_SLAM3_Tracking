@@ -5,6 +5,7 @@ from typing import List, Tuple, Optional
 from src.ORB_Extractor import ORBExtractor
 from src.ORBMatcher3D import ORBMatcher3D
 
+
 class Camera:
     def __init__(self, fx: float, fy: float, cx: float, cy: float):
         self.fx = fx
@@ -80,12 +81,12 @@ class Tracking:
         T1 = np.eye(4, dtype=np.float32)
         T2 = np.eye(4, dtype=np.float32)
         T2[:3, :3] = R
-        T2[:3, 3] = t.flatten()
+        T2[:3, 3] = t.flatten() * 0.1  # Scale down translation
 
         projMatr1 = self.camera.K @ T1[:3]
         projMatr2 = self.camera.K @ T2[:3]
         points_4d = cv2.triangulatePoints(projMatr1, projMatr2, pts1.T, pts2.T)
-        points_3d = (points_4d[:3] / points_4d[3]).T * 0.05  # Further scale down
+        points_3d = (points_4d[:3] / points_4d[3]).T * 0.05
 
         for i, pt_3d in enumerate(points_3d):
             if not np.isfinite(pt_3d).all() or pt_3d[2] <= 0:
@@ -134,14 +135,14 @@ class Tracking:
                         _, R, t, mask = cv2.recoverPose(E, good_curr, good_prev, self.camera.K)
                         predicted_pose = np.eye(4, dtype=np.float32)
                         predicted_pose[:3, :3] = R
-                        predicted_pose[:3, 3] = t.flatten()
+                        predicted_pose[:3, 3] = t.flatten() * 0.1  # Scale down translation
                         return predicted_pose
 
         predicted_pose = self.last_pose.copy()
-        predicted_pose[:3, 3] += self.velocity * 1.5
+        predicted_pose[:3, 3] += self.velocity * 0.5  # Scale down velocity contribution
         R = predicted_pose[:3, :3]
         rvec, _ = cv2.Rodrigues(R)
-        rvec_pred = rvec + self.angular_velocity * 1.5
+        rvec_pred = rvec + self.angular_velocity * 0.5
         R_pred, _ = cv2.Rodrigues(rvec_pred)
         predicted_pose[:3, :3] = R_pred
         return predicted_pose
@@ -222,6 +223,9 @@ class Tracking:
                 self.raw_matches = []
                 self.tracking_failure_count = 0
             self.matches = matches
+            # Still append the predicted pose to keep the trajectory dense
+            self.trajectory.append(predicted_pose)
+            self.last_pose = predicted_pose
             return None
 
         self.tracking_failure_count = 0
@@ -271,10 +275,9 @@ class Tracking:
         R = initial_pose[:3, :3]
         t = initial_pose[:3, 3]
         rvec, _ = cv2.Rodrigues(R)
-        tvec = t.reshape(3, 1)  # Ensure shape (3, 1)
-        rvec = rvec.reshape(3, 1)  # Ensure shape (3, 1)
+        tvec = t.reshape(3, 1)
+        rvec = rvec.reshape(3, 1)
 
-        # Debug shapes
         print(f"optimize_pose: kps_2d shape: {kps_2d.shape}, pts_3d shape: {pts_3d.shape}")
         print(f"rvec shape: {rvec.shape}, tvec shape: {tvec.shape}")
 
@@ -330,10 +333,15 @@ class Tracking:
         print(f"Added {len(good_matches)} new points to map. Total: {len(self.active_map)}")
 
 class Camera3D:
-    def __init__(self, focal_length: float = 1000.0):
+    def __init__(self, focal_length: float = 2000.0):  # Increased focal length for less distortion
         self.focal_length = focal_length
-        self.position = np.array([0, 0, 10], dtype=np.float32)
-        self.rotation = np.eye(3, dtype=np.float32)
+        self.position = np.array([0, -1, 3], dtype=np.float32)  # Move closer to the trajectory
+        pitch = np.array([
+            [1, 0, 0],
+            [0, np.cos(np.radians(-20)), -np.sin(np.radians(-20))],  # Reduced pitch angle
+            [0, np.sin(np.radians(-20)), np.cos(np.radians(-20))]
+        ])
+        self.rotation = pitch
 
     def project(self, point_3d: np.ndarray) -> Tuple[int, int]:
         point_cam = point_3d - self.position
@@ -348,24 +356,23 @@ class Camera3D:
 
 class Visualizer:
     def __init__(self):
-        self.camera = Camera3D(focal_length=1000.0)
+        self.camera = Camera3D(focal_length=2000.0)
         self.points = []
         self.poses = []
 
     def update(self, points: List[np.ndarray], poses: List[np.ndarray]):
-        self.points = [point * 0.05 for point in points]
         self.poses = poses
 
-    def draw_frustum(self, screen, pose: np.ndarray, scale: float = 0.1):
+    def draw_frustum(self, screen, pose: np.ndarray, scale: float = 0.05) -> List[Tuple[int, int]]:  # Reduced scale
         corners = np.array([
             [ scale,  scale,  scale],
             [ scale, -scale,  scale],
             [-scale, -scale,  scale],
             [-scale,  scale,  scale],
-            [ scale * 2,  scale * 2,  scale * 3],
-            [ scale * 2, -scale * 2,  scale * 3],
-            [-scale * 2, -scale * 2,  scale * 3],
-            [-scale * 2,  scale * 2,  scale * 3],
+            [ scale * 1.5,  scale * 1.5,  scale * 2],  # Adjusted frustum proportions
+            [ scale * 1.5, -scale * 1.5,  scale * 2],
+            [-scale * 1.5, -scale * 1.5,  scale * 2],
+            [-scale * 1.5,  scale * 1.5,  scale * 2],
         ])
 
         R = pose[:3, :3]
@@ -374,7 +381,7 @@ class Visualizer:
 
         projected = [self.camera.project(corner) for corner in corners_world]
         if any(p is None for p in projected):
-            return
+            return None
 
         pygame.draw.polygon(screen, CYAN, projected[:4], 1)
         pygame.draw.polygon(screen, CYAN, projected[4:], 1)
@@ -383,19 +390,31 @@ class Visualizer:
             pygame.draw.line(screen, CYAN, projected[i], projected[i + 4], 1)
             pygame.draw.line(screen, CYAN, projected[i + 4], projected[(i + 1) % 4 + 4], 1)
 
+        return projected
+
     def draw(self, screen):
-        screen.fill(BLACK)
+        gradient_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        center = (WIDTH // 2, HEIGHT // 2)
+        max_radius = max(WIDTH, HEIGHT)
+        for r in range(max_radius, 0, -10):
+            alpha = int(50 * (1 - r / max_radius))
+            color = (0, 50, 100, alpha)
+            pygame.draw.circle(gradient_surface, color, center, r)
+        screen.blit(gradient_surface, (0, 0))
 
-        for point in self.points:
-            projected = self.camera.project(point)
-            if projected:
-                x, y = projected
-                if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-                    pygame.draw.circle(screen, WHITE, (x, y), 1)
-
+        previous_projected = None
         for i, pose in enumerate(self.poses):
-            if i % 5 == 0:
-                self.draw_frustum(screen, pose)
+            projected = self.draw_frustum(screen, pose)
+            if projected is None:
+                previous_projected = None
+                continue
+
+            if previous_projected is not None:
+                for j in range(4):
+                    pygame.draw.line(screen, CYAN, previous_projected[j], projected[j], 1)
+                    pygame.draw.line(screen, CYAN, previous_projected[j + 4], projected[j + 4], 1)
+
+            previous_projected = projected
 
     def update_camera(self, mouse_dx: float, mouse_dy: float):
         yaw = mouse_dx * 0.005
@@ -414,10 +433,9 @@ class Visualizer:
 
 class DebugVisualizer:
     def __init__(self, width: int, height: int):
-        self.screen = pygame.display.set_mode((width, height))
-        pygame.display.set_caption("ORB Features Debug")
         self.width = width
         self.height = height
+        self.surface = pygame.Surface((width, height))
 
     def draw(self, frame: np.ndarray, keypoints: List[cv2.KeyPoint], raw_matches: List[cv2.DMatch], 
              matches: List[cv2.DMatch], tracker: 'Tracking', pose: Optional[np.ndarray]):
@@ -425,14 +443,14 @@ class DebugVisualizer:
         frame_resized = cv2.resize(frame_rgb, (self.width, self.height))
         frame_surface = pygame.surfarray.make_surface(frame_resized.swapaxes(0, 1))
 
-        self.screen.blit(frame_surface, (0, 0))
+        self.surface.blit(frame_surface, (0, 0))
 
         scale_x = self.width / frame.shape[1]
         scale_y = self.height / frame.shape[0]
 
         for kp in keypoints:
             x, y = int(kp.pt[0] * scale_x), int(kp.pt[1] * scale_y)
-            pygame.draw.circle(self.screen, (0, 255, 0), (x, y), 3)
+            pygame.draw.circle(self.surface, (0, 255, 0), (x, y), 3)
 
         for match in raw_matches:
             map_idx = match.queryIdx
@@ -445,7 +463,7 @@ class DebugVisualizer:
                 continue
             kp = keypoints[frame_idx]
             x, y = int(kp.pt[0] * scale_x), int(kp.pt[1] * scale_y)
-            pygame.draw.circle(self.screen, (255, 255, 0), (x, y), 5, 2)
+            pygame.draw.circle(self.surface, (255, 255, 0), (x, y), 5, 2)
 
         if pose is not None and matches and tracker.active_map:
             Rcw = pose[:3, :3]
@@ -461,7 +479,7 @@ class DebugVisualizer:
                     continue
                 kp = keypoints[frame_idx]
                 x, y = int(kp.pt[0] * scale_x), int(kp.pt[1] * scale_y)
-                pygame.draw.circle(self.screen, (255, 0, 0), (x, y), 5, 2)
+                pygame.draw.circle(self.surface, (255, 0, 0), (x, y), 5, 2)
 
                 map_point = tracker.active_map[map_idx].position
                 point_cam = Rcw @ map_point + tcw
@@ -470,7 +488,12 @@ class DebugVisualizer:
                     y_proj = int(tracker.camera.fy * point_cam[1] / point_cam[2] + tracker.camera.cy)
                     x_proj = int(x_proj * scale_x)
                     y_proj = int(y_proj * scale_y)
-                    pygame.draw.line(self.screen, (0, 0, 255), (x, y), (x_proj, y_proj), 1)
+                    pygame.draw.line(self.surface, (0, 0, 255), (x, y), (x_proj, y_proj), 1)
+
+        debug_array = pygame.surfarray.array3d(self.surface)
+        debug_array = np.transpose(debug_array, (1, 0, 2))
+        debug_array = cv2.cvtColor(debug_array, cv2.COLOR_RGB2BGR)
+        cv2.imshow("ORB Features Debug", debug_array)
 
 # Main script
 pygame.init()
@@ -480,7 +503,6 @@ DEBUG_WIDTH, DEBUG_HEIGHT = 640, 480
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("ORB-SLAM3 Video Visualization")
 
-debug_screen = pygame.display.set_mode((DEBUG_WIDTH, DEBUG_HEIGHT), pygame.DOUBLEBUF)
 debug_visualizer = DebugVisualizer(DEBUG_WIDTH, DEBUG_HEIGHT)
 
 BLACK = (0, 0, 0)
@@ -535,9 +557,12 @@ while running:
     if tracker.last_frame:
         debug_visualizer.draw(frame, tracker.last_frame.keypoints, tracker.raw_matches, 
                              tracker.matches, tracker, pose)
-        pygame.display.flip()
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        running = False
 
     clock.tick(30)
 
 cap.release()
+cv2.destroyAllWindows()
 pygame.quit()
